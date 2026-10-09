@@ -441,11 +441,12 @@ describe("GithubCopilotPlugin", () => {
       })
       yield* addPlugin()
       // The plugin loads the model list in the background; poll on real time because the
-      // test clock does not advance on its own.
+      // test clock does not advance on its own. Cap at ~2s so a regression fails the
+      // assertions below instead of hanging until the runner timeout.
       const fallback = yield* Effect.promise(() => Bun.sleep(10)).pipe(
         Effect.andThen(models.get(Provider.ID.githubCopilot, Model.ID.make("claude-sonnet-5"))),
         Effect.map(required),
-        Effect.repeat({ until: (model) => model.settings?.baseURL !== "https://api.githubcopilot.com/v1" }),
+        Effect.repeat({ until: (model) => model.settings?.baseURL !== "https://api.githubcopilot.com/v1", times: 200 }),
       )
       expect(fallback.package).toBe("@opencode/ai/providers/anthropic")
       expect(fallback.settings?.baseURL).toBe(`${server.url.origin}/v1`)
