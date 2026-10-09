@@ -20,6 +20,7 @@ import {
 import { Message, SystemPart } from "@opencode/ai"
 import { Provider } from "@opencode/core/provider"
 import { Integration } from "@opencode/core/integration"
+import { Credential } from "@opencode/core/credential"
 import type { SessionRequestKind } from "@opencode/plugin/effect/session"
 import { fakeSelectorSdk } from "../fixture/selector"
 import { testEffect } from "../lib/effect"
@@ -388,6 +389,96 @@ describe("GithubCopilotPlugin", () => {
       })
       expect(resolved.route.id).toBe("ai-sdk:@ai-sdk/github-copilot")
       expect(resolved.route.providerMetadataKey).toBe("copilot")
+    }),
+  )
+
+  it.effect("keeps models.dev Anthropic fallback models on Messages", () =>
+    Effect.gen(function* () {
+      const providers = yield* Provider.Service
+      const models = yield* Model.Service
+      yield* providers.transform((editor) => {
+        editor.update(Provider.ID.githubCopilot, (provider) => {
+          provider.activation = "enabled"
+        })
+        editor.models.update(Provider.ID.githubCopilot, Model.ID.make("claude-sonnet-5"), (model) => {
+          model.package = "@opencode/ai/providers/anthropic"
+          model.settings = { baseURL: "https://api.githubcopilot.com/v1" }
+        })
+      })
+      yield* addPlugin()
+      const fallback = required(yield* models.get(Provider.ID.githubCopilot, Model.ID.make("claude-sonnet-5")))
+      expect(fallback.package).toBe("@opencode/ai/providers/anthropic")
+      expect(fallback.settings?.baseURL).toBe("https://api.githubcopilot.com/v1")
+    }),
+  )
+
+  it.effect("points Anthropic fallback models at the account's Copilot Messages endpoint", () =>
+    Effect.gen(function* () {
+      const server = Bun.serve({ port: 0, fetch: () => new Response("blocked", { status: 503 }) })
+      yield* Effect.addFinalizer(() => Effect.promise(() => server.stop(true)))
+      const providers = yield* Provider.Service
+      const models = yield* Model.Service
+      const credentials = yield* Credential.Service
+      yield* providers.transform((editor) => {
+        editor.update(Provider.ID.githubCopilot, (provider) => {
+          provider.activation = "enabled"
+        })
+        editor.models.update(Provider.ID.githubCopilot, Model.ID.make("claude-sonnet-5"), (model) => {
+          model.package = "@opencode/ai/providers/anthropic"
+          model.settings = { baseURL: "https://api.githubcopilot.com/v1" }
+        })
+      })
+      yield* credentials.create({
+        integrationID: Integration.ID.make("github-copilot"),
+        value: Credential.OAuth.make({
+          type: "oauth",
+          methodID: Integration.MethodID.make("device"),
+          access: "token",
+          refresh: "token",
+          expires: 0,
+          metadata: { apiEndpoint: server.url.origin },
+        }),
+      })
+      yield* addPlugin()
+      // The plugin loads the model list in the background; poll on real time because the
+      // test clock does not advance on its own.
+      const fallback = yield* Effect.promise(() => Bun.sleep(10)).pipe(
+        Effect.andThen(models.get(Provider.ID.githubCopilot, Model.ID.make("claude-sonnet-5"))),
+        Effect.map(required),
+        Effect.repeat({ until: (model) => model.settings?.baseURL !== "https://api.githubcopilot.com/v1" }),
+      )
+      expect(fallback.package).toBe("@opencode/ai/providers/anthropic")
+      expect(fallback.settings?.baseURL).toBe(`${server.url.origin}/v1`)
+    }),
+  )
+
+  it.effect("routes models.dev OpenAI fallback models to Copilot Responses", () =>
+    Effect.gen(function* () {
+      const providers = yield* Provider.Service
+      const models = yield* Model.Service
+      const aisdk = yield* AISDK.Service
+      const calls: string[] = []
+      yield* providers.transform((editor) => {
+        editor.update(Provider.ID.githubCopilot, (provider) => {
+          provider.activation = "enabled"
+        })
+        editor.models.update(Provider.ID.githubCopilot, Model.ID.make("gpt-5-mini"), (model) => {
+          model.package = "@opencode/ai/providers/openai"
+        })
+        editor.models.update(Provider.ID.githubCopilot, Model.ID.make("gemini-3.8-flash"), (model) => {
+          model.package = undefined
+        })
+      })
+      yield* addPlugin()
+      const responses = required(yield* models.get(Provider.ID.githubCopilot, Model.ID.make("gpt-5-mini")))
+      const chat = required(yield* models.get(Provider.ID.githubCopilot, Model.ID.make("gemini-3.8-flash")))
+      expect(responses.package).toBe(Provider.aisdk("@ai-sdk/github-copilot"))
+      expect(responses.settings?.endpoint).toBe("responses")
+      expect(chat.package).toBe(Provider.aisdk("@ai-sdk/github-copilot"))
+      expect(chat.settings?.endpoint).toBeUndefined()
+      for (const model of [responses, chat])
+        yield* aisdk.runLanguage({ model, sdk: fakeSelectorSdk(calls), options: model.settings ?? {} })
+      expect(calls).toEqual(["responses:gpt-5-mini", "chat:gemini-3.8-flash"])
     }),
   )
 
